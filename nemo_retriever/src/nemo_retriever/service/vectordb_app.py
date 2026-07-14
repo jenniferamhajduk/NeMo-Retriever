@@ -34,14 +34,24 @@ import asyncio
 import logging
 import threading
 from contextlib import asynccontextmanager
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Union
 
 import lancedb
 import uvicorn
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-from nemo_retriever.service.query_schema import QueryRequest, QueryResponse, QueryResult
+from nemo_retriever.query.evidence import build_evidence_result
+from nemo_retriever.service.query_schema import (
+    EvidenceQueryResponse,
+    EvidenceResult,
+    QueryRequest,
+    QueryResponse,
+    QueryResult,
+)
+
+# /v1/query is dense vector search only; report that honestly in coverage.
+_QUERY_STRATEGIES = ["dense"]
 
 logger = logging.getLogger(__name__)
 
@@ -80,12 +90,14 @@ def _embed_queries_remote(
     embed_model: str,
     embed_endpoint: str,
     embed_api_key: str,
+    embed_model_provider_prefix: str | None = None,
 ) -> list[list[float]]:
     from nemo_retriever.models.nim.util import infer_microservice
 
     return infer_microservice(
         texts,
         model_name=embed_model,
+        model_provider_prefix=embed_model_provider_prefix,
         embedding_endpoint=embed_endpoint,
         nvidia_api_key=embed_api_key or None,
         input_type="query",
@@ -107,6 +119,7 @@ class VectorDBState:
         embed_model: str,
         embed_api_key: str,
         *,
+        embed_model_provider_prefix: str | None = None,
         local_embed: bool = False,
         local_embed_backend: str = "hf",
         hf_cache_dir: str | None = None,
@@ -117,6 +130,7 @@ class VectorDBState:
         self.table_name = table_name
         self.embed_endpoint = embed_endpoint
         self.embed_model = embed_model
+        self.embed_model_provider_prefix = embed_model_provider_prefix
         self.embed_api_key = embed_api_key
         self.local_embed = local_embed
         self.local_embed_backend = local_embed_backend
@@ -234,6 +248,7 @@ class VectorDBState:
             return _embed_queries_remote(
                 texts,
                 embed_model=self.embed_model,
+                embed_model_provider_prefix=self.embed_model_provider_prefix,
                 embed_endpoint=self.embed_endpoint,
                 embed_api_key=self.embed_api_key,
             )
@@ -258,6 +273,7 @@ def create_vectordb_app(
     table_name: str = "nemo_retriever",
     embed_endpoint: str = "",
     embed_model: str = "nvidia/llama-nemotron-embed-vl-1b-v2",
+    embed_model_provider_prefix: str | None = None,
     embed_api_key: str = "",
     *,
     local_embed: bool = False,
@@ -276,6 +292,7 @@ def create_vectordb_app(
             table_name=table_name,
             embed_endpoint=embed_endpoint,
             embed_model=embed_model,
+            embed_model_provider_prefix=embed_model_provider_prefix,
             embed_api_key=embed_api_key,
             local_embed=local_embed,
             local_embed_backend=local_embed_backend,
@@ -327,8 +344,8 @@ def create_vectordb_app(
         written = await asyncio.to_thread(_state.write_rows, req.rows)
         return WriteResponse(written=written, total_rows=_state.total_rows())
 
-    @app.post("/v1/query", response_model=QueryResponse, tags=["query"])
-    async def query(req: QueryRequest) -> QueryResponse:
+    @app.post("/v1/query", response_model=Union[QueryResponse, EvidenceQueryResponse], tags=["query"])
+    async def query(req: QueryRequest) -> QueryResponse | EvidenceQueryResponse:
         if _state is None:
             raise HTTPException(503, "VectorDB not initialised")
 
@@ -347,14 +364,20 @@ def create_vectordb_app(
 
         queries = req.query if isinstance(req.query, list) else [req.query]
         if not queries:
+            if req.format == "evidence":
+                return EvidenceQueryResponse(results=[])
             return QueryResponse(results=[])
 
         async with _query_semaphore:
             vectors = await asyncio.to_thread(_state.embed_queries, queries)
             hits_per_query = await asyncio.to_thread(_state.search, vectors, req.top_k)
 
-        results = [QueryResult(hits=hits) for hits in hits_per_query]
-        return QueryResponse(results=results)
+        if req.format == "evidence":
+            return EvidenceQueryResponse(
+                results=[EvidenceResult(**build_evidence_result(hits, _QUERY_STRATEGIES)) for hits in hits_per_query]
+            )
+
+        return QueryResponse(results=[QueryResult(hits=hits) for hits in hits_per_query])
 
     return app
 
@@ -368,6 +391,7 @@ def main() -> None:
     parser.add_argument("--table-name", default="nemo_retriever", help="LanceDB table name")
     parser.add_argument("--embed-endpoint", default="", help="Remote NIM/OpenAI-compatible embed URL")
     parser.add_argument("--embed-model", default="nvidia/llama-nemotron-embed-vl-1b-v2")
+    parser.add_argument("--embed-model-provider-prefix", default="", help="Optional LiteLLM provider prefix")
     parser.add_argument("--embed-api-key", default="")
     parser.add_argument(
         "--local-embed",
@@ -406,6 +430,7 @@ def main() -> None:
         table_name=args.table_name,
         embed_endpoint=args.embed_endpoint,
         embed_model=args.embed_model,
+        embed_model_provider_prefix=args.embed_model_provider_prefix or None,
         embed_api_key=args.embed_api_key,
         local_embed=args.local_embed,
         local_embed_backend=args.local_embed_backend,
