@@ -93,15 +93,9 @@ def test_root_help_lists_only_product_workflows() -> None:
         assert f"│ {developer_command} " not in result.output
 
 
-def test_pipeline_compatibility_command_is_hidden_but_callable() -> None:
-    result = RUNNER.invoke(cli_main.app, ["pipeline", "--help"])
-
-    assert result.exit_code == 0
-
-
 @pytest.mark.parametrize(
     "removed_command",
-    ("txt", "html", "local", "audio", "image", "pdf", "chart", "compare"),
+    ("txt", "html", "local", "audio", "image", "pdf", "chart", "compare", "pipeline"),
 )
 def test_removed_root_commands_are_not_callable(removed_command: str) -> None:
     result = RUNNER.invoke(cli_main.app, [removed_command, "--help"])
@@ -167,6 +161,7 @@ def test_root_ingest_runs_default_execution_chain(monkeypatch, tmp_path) -> None
         "uri": "lancedb",
         "table_name": "nemo-retriever",
         "overwrite": True,
+        "embedding_model_name": "nvidia/llama-nemotron-embed-vl-1b-v2",
     }
     assert "Ingested 1 file(s) → 7 row(s) in LanceDB lancedb/nemo-retriever." in result.output
 
@@ -207,6 +202,7 @@ def test_root_ingest_without_mode_accepts_local_options_before_documents(monkeyp
         "uri": "/tmp/default-lancedb",
         "table_name": "nemo-retriever",
         "overwrite": False,
+        "embedding_model_name": "nvidia/llama-nemotron-embed-vl-1b-v2",
     }
 
 
@@ -246,6 +242,7 @@ def test_root_ingest_service_mode_uses_service_ingest_core(tmp_path, monkeypatch
             return self
 
         def ingest(self, *args: Any, **kwargs: Any):
+            captured["ingest_kwargs"] = kwargs
             return self
 
     monkeypatch.setattr(service_ingestor_module, "ServiceIngestor", _FakeServiceIngestor)
@@ -293,6 +290,7 @@ def test_root_ingest_service_mode_uses_service_ingest_core(tmp_path, monkeypatch
     assert captured["dedup_params"].iou_threshold == 0.6
     assert captured["caption_params"].context_text_max_chars == 12
     assert captured["embed_params"].embed_granularity == "page"
+    assert captured["ingest_kwargs"] == {"return_results": True}
     assert "through retriever service http://retriever-service:7670" in result.output
 
 
@@ -400,6 +398,7 @@ def test_root_ingest_passes_vdb_options_and_run_mode(monkeypatch, tmp_path) -> N
         "uri": "/tmp/lancedb",
         "table_name": "docs",
         "overwrite": True,
+        "embedding_model_name": "nvidia/llama-nemotron-embed-vl-1b-v2",
     }
     assert "Ingested 2 file(s) → 12 row(s) in LanceDB /tmp/lancedb/docs." in result.output
 
@@ -418,6 +417,7 @@ def test_root_ingest_append_forwards_overwrite_false(monkeypatch, tmp_path) -> N
         "uri": "lancedb",
         "table_name": "nemo-retriever",
         "overwrite": False,
+        "embedding_model_name": "nvidia/llama-nemotron-embed-vl-1b-v2",
     }
 
 
@@ -515,8 +515,9 @@ def test_root_ingest_passes_nim_url_options(monkeypatch, tmp_path) -> None:
     assert isinstance(embed_params, EmbedParams)
     assert embed_params.embed_invoke_url == "http://embed:8000/v1/embeddings"
     assert embed_params.embedding_endpoint == "http://embed:8000/v1/embeddings"
-    assert embed_params.model_name == "nvidia/nvidia/llama-nemotron-embed-1b-v2"
-    assert embed_params.embed_model_name == "nvidia/nvidia/llama-nemotron-embed-1b-v2"
+    assert embed_params.model_name == "nvidia/llama-nemotron-embed-1b-v2"
+    assert embed_params.embed_model_name == "nvidia/llama-nemotron-embed-1b-v2"
+    assert embed_params.embed_model_provider_prefix == "nvidia"
 
 
 def test_root_ingest_passes_embedding_overrides_without_stage_flags(monkeypatch, tmp_path) -> None:
@@ -1050,7 +1051,7 @@ def test_root_ingest_help_defaults_to_local_workflow(monkeypatch: pytest.MonkeyP
     )
 
     assert result.exit_code == 0
-    assert "Usage: retriever ingest [OPTIONS] DOCUMENTS..." in result.output
+    assert "Usage: retriever ingest [OPTIONS] {documents}..." in result.output
     assert "input formats, not commands" in result.output
     assert "CPU-only hosts use NVIDIA's hosted embedding endpoint" in result.output
     assert "retriever ingest batch --help" in result.output
@@ -1097,7 +1098,7 @@ def test_root_ingest_batch_help_remains_mode_specific(monkeypatch: pytest.Monkey
     result = RUNNER.invoke(cli_main.app, ["ingest", "batch", "--help"])
 
     assert result.exit_code == 0
-    assert "Usage: root ingest batch [OPTIONS] DOCUMENTS..." in result.output
+    assert "Usage: root ingest batch [OPTIONS] {documents}..." in result.output
     assert "--ray-address" in result.output
     assert "--pdf-extract-workers" in result.output
     assert "--lancedb-uri" in result.output
@@ -1109,14 +1110,14 @@ def test_root_ingest_local_help_uses_shared_graph_contract() -> None:
     result = RUNNER.invoke(cli_main.app, ["ingest", "local", "--help"], prog_name="retriever")
 
     assert result.exit_code == 0
-    assert "Usage: retriever ingest [OPTIONS] DOCUMENTS..." in result.output
+    assert "Usage: retriever ingest [OPTIONS] {documents}..." in result.output
     assert "retriever ingest local" not in result.output
     assert "--input-type" not in result.output
     assert "--run-mode" not in result.output
     assert "--service-url" not in result.output
     assert "--ray-address" in result.output
     assert "--profile" in result.output
-    assert "[auto|fast-text]" in result.output
+    assert "<auto|fast-text>" in result.output
     assert "--extract-images" in result.output
     assert "--use-page" not in result.output
     assert "--use-graphic" not in result.output
@@ -1170,7 +1171,7 @@ def test_root_ingest_service_help_hides_local_only_options() -> None:
     result = RUNNER.invoke(cli_main.app, ["ingest", "service", "--help"], env={"COLUMNS": "200"})
 
     assert result.exit_code == 0
-    assert "Usage: root ingest service [OPTIONS] DOCUMENTS..." in result.output
+    assert "Usage: root ingest service [OPTIONS] {documents}..." in result.output
     assert "--service-url" in result.output
     assert "--extract-images" in result.output
     assert "--embed-granular" in result.output
@@ -1700,6 +1701,7 @@ def test_root_ingest_index_mode_hybrid_passes_hybrid_into_vdb_kwargs(monkeypatch
         "table_name": "docs",
         "overwrite": True,
         "hybrid": True,
+        "embedding_model_name": "nvidia/llama-nemotron-embed-vl-1b-v2",
     }
 
 
@@ -1762,5 +1764,7 @@ def test_root_ingest_index_mode_sparse_skips_embedding_and_writes_fts_table(monk
     table = lancedb.connect(str(tmp_path / "db")).open_table("sparse_docs")
     assert "vector" not in table.schema.names
     assert table.schema.metadata[b"retrieval_mode"] == b"sparse"
+    assert table.schema.metadata[b"nemo_retriever.retrieval_mode"] == b"sparse"
+    assert b"nemo_retriever.embedding_model_name" not in table.schema.metadata
     index_names = {index.name.lower() for index in table.list_indices()}
     assert any("text" in name or "fts" in name for name in index_names)

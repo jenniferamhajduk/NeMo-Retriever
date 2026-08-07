@@ -1,14 +1,29 @@
 [build-system]
-requires = ["setuptools>=78.1.1", "wheel>=0.46.2"]
+requires = ["setuptools", "wheel>=0.46.2", "packaging"]
 build-backend = "setuptools.build_meta"
 
 [tool.uv]
 managed = true
 package = true
 no-build-package = ["nemotron-ocr"]
+# The complete dependency graph, including `local`, must resolve on both Linux
+# architectures. Windows x64 and macOS x64/ARM64 support only the base install
+# and are validated separately by CI.
+required-environments = [
+  "sys_platform == 'linux' and platform_machine == 'x86_64'",
+  "sys_platform == 'linux' and platform_machine == 'aarch64'",
+]
 # fastparquet 2026.3.0 has no wheel for Linux x86_64 (manylinux); constrain to last version that does.
 override-dependencies = [
   "fastparquet>=2024.11.0,<2026",
+  # Security minimums for transitive dependencies.
+  "langsmith>=0.8.18",
+  "msgpack>=1.2.1",
+  "cryptography>=48.0.1",
+  "aiohttp>=3.14.3",
+  "requests>=2.33.0",
+  "idna>=3.15",
+  "pydantic-settings>=2.14.2",
   # Suppress opencv-python from transitive deps. nemotron wheels pull in both
   # opencv-python and opencv-python-headless, which stomp on the same cv2/ dir.
   # The 'never' marker makes uv treat this as unsatisfiable on all platforms.
@@ -54,7 +69,7 @@ dependencies = [
   "fastmcp>=2.0.0",
   # HTTP clients
   "httpx>=0.27.0",
-  "requests>=2.32.5",
+  "requests>=2.33.0",
   "urllib3==2.7.0",
   # Utilities
   "pydantic>=2.8.0",
@@ -81,7 +96,7 @@ dependencies = [
 [project.optional-dependencies]
 
 # Core ``pip install nemo-retriever`` (no extras) supports remote HTTP NIM and the
-# ``retriever pipeline`` CLI without ``tritonclient``. Triton gRPC is imported only
+# ``retriever ingest`` / ``retriever query`` CLIs without ``tritonclient``. Triton gRPC is imported only
 # when a gRPC client is constructed; install ``nemo-retriever[local]`` for on-box
 # Triton + GPU stacks (``tritonclient`` is listed under ``local``).
 
@@ -93,6 +108,9 @@ dependencies = [
 service = [
   # HTTP retry decorator used by NIM model interfaces
   "backoff",
+  # Exact tokenizer-only TXT/HTML chunking; no transformers, torch, or weights.
+  "tokenizers>=0.21.1",
+  "huggingface-hub>=0.34.0",
   # Remote answer generation client used by serviceConfig.llm and /v1/answer
   "litellm>=1.86.0,<2",
   # Lightweight utilities used by pipeline operators
@@ -211,7 +229,7 @@ dev = [
   "nemo_retriever[dev]",
   "nemotron-page-elements-v3>=3.0.1.dev0,!=3.0.1,!=3.0.2,<4",
   "nemotron-table-structure-v1>=1.0.1.dev0,!=1.0.1,<2",
-  "nemotron-ocr>=2.0.1.dev0,!=2.0.1,<3; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
+  "nemotron-ocr>=2.0.1.dev0,!=2.0.1,!=2.0.2,<3; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
 ]
 
 [tool.setuptools.dynamic]
