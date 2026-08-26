@@ -13,6 +13,7 @@ import pandas as pd
 import pytest
 
 from nemo_retriever.graph.retriever import Retriever
+from nemo_retriever.operators.abstract_operator import AbstractOperator
 from nemo_retriever.query.shaping import shape_query_hits
 
 
@@ -60,6 +61,14 @@ def _install_mock_graph(monkeypatch: pytest.MonkeyPatch, hits: list[list[dict[st
 
 
 class TestQueriesGraphExecution:
+    @pytest.fixture(autouse=True)
+    def _mock_index_metadata(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        metadata_reader = MagicMock()
+        metadata_reader.get_index_metadata.return_value = None
+        monkeypatch.setattr(
+            "nemo_retriever.graph.retriever.RetrieveVdbOperator", MagicMock(return_value=metadata_reader)
+        )
+
     def test_empty_queries_returns_empty(self, monkeypatch: pytest.MonkeyPatch) -> None:
         mock_get = MagicMock()
         monkeypatch.setattr(Retriever, "_get_graph", mock_get)
@@ -86,6 +95,58 @@ class TestQueriesGraphExecution:
         r = _make_retriever(embed_kwargs={"model_name": "base", "embed_model_name": "base"})
         p = r._merge_embed_params({"model_name": "call"})
         assert p.model_name == "call"
+
+    @pytest.mark.parametrize(
+        ("explicit_embed_kwargs", "query_embed_kwargs"),
+        [
+            ({"model_name": "acme/model-b", "embed_model_name": "acme/model-b"}, None),
+            ({}, {"model_name": "acme/model-b", "embed_model_name": "acme/model-b"}),
+        ],
+    )
+    def test_explicit_model_mismatch_warns_and_continues(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+        explicit_embed_kwargs: dict[str, str],
+        query_embed_kwargs: dict[str, str] | None,
+    ) -> None:
+        graph = _install_mock_graph(monkeypatch, [[{"text": "retrieved"}]])
+        metadata_reader = MagicMock()
+        metadata_reader.get_index_metadata.side_effect = lambda key, **_kwargs: {
+            "embedding_model_name": "acme/model-a",
+            "embedding_model_revision": "a" * 40,
+        }.get(key)
+        reader_factory = MagicMock(return_value=metadata_reader)
+        monkeypatch.setattr("nemo_retriever.graph.retriever.RetrieveVdbOperator", reader_factory)
+        retriever = _make_retriever(embed_kwargs=explicit_embed_kwargs)
+
+        with caplog.at_level("WARNING", logger="nemo_retriever.graph.retriever"):
+            out = retriever.queries(["q"], embed_kwargs=query_embed_kwargs)
+
+        assert out == [[{"text": "retrieved"}]]
+        assert "query embedding model 'acme/model-b' differs" in caplog.text
+        assert "model 'acme/model-a' recorded on the index" in caplog.text
+        assert "Continuing with the explicitly configured model" in caplog.text
+        reader_factory.assert_called_once()
+        graph.execute_in_place.assert_called_once()
+
+    def test_explicit_model_matching_index_does_not_warn(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        _install_mock_graph(monkeypatch, [[{"text": "retrieved"}]])
+        metadata_reader = MagicMock()
+        metadata_reader.get_index_metadata.side_effect = lambda key, **_kwargs: {
+            "embedding_model_name": "acme/model-a",
+        }.get(key)
+        monkeypatch.setattr(
+            "nemo_retriever.graph.retriever.RetrieveVdbOperator", MagicMock(return_value=metadata_reader)
+        )
+        retriever = _make_retriever(embed_kwargs={"model_name": "acme/model-a", "embed_model_name": "acme/model-a"})
+
+        with caplog.at_level("WARNING", logger="nemo_retriever.graph.retriever"):
+            retriever.queries(["q"])
+
+        assert not caplog.records
 
     def test_index_model_keeps_constructor_provider_prefix(self) -> None:
         retriever = _make_retriever(
@@ -304,6 +365,32 @@ class TestQueriesGraphExecution:
 
         assert graph.resolve_for_local_execution.call_count == 2
 
+    @patch("nemo_retriever.graph.retriever.resolve_embed_model_spec")
+    def test_custom_graph_does_not_resolve_default_embedding_model(self, resolve_spec: MagicMock) -> None:
+        hits = [[{"text": "retrieved", "source": "doc.pdf", "page_number": 1}]]
+
+        class ResolvedGraph:
+            def execute(self, df: pd.DataFrame, **_kwargs: Any) -> list[Any]:
+                assert list(df.columns) == ["query_text"]
+                assert df["query_text"].tolist() == ["find doc"]
+                return [hits]
+
+        class Graph:
+            def resolve_for_local_execution(self) -> ResolvedGraph:
+                return ResolvedGraph()
+
+        retriever = Retriever(
+            graph=Graph(),
+            embed_kwargs={
+                "text_column": "query_text",
+                "embed_model_name": "nvidia/llama-nemotron-embed-vl-1b-v2",
+                "local_ingest_embed_backend": None,
+            },
+        )
+
+        assert retriever.query("find doc") == hits[0]
+        resolve_spec.assert_not_called()
+
     def test_embed_override_invalidates_graph_cache(self, monkeypatch: pytest.MonkeyPatch) -> None:
         hits = [[{"text": "retrieved", "source": "doc.pdf", "page_number": 1}]]
         graph_one = MagicMock()
@@ -326,6 +413,72 @@ class TestQueriesGraphExecution:
     def test_candidate_k_must_cover_top_k(self) -> None:
         with pytest.raises(ValueError, match=r"candidate_k \(2\).*top_k \(5\)"):
             _make_retriever(top_k=5).queries(["q"], candidate_k=2)
+
+
+class TestRerankEndpointWiring:
+    """A reranker endpoint set through ``rerank_kwargs`` must be the one that serves the request.
+
+    ``NemotronRerankActor`` dispatches on ``rerank_invoke_url``; an endpoint
+    stored under any other key leaves the remote variant unselected and loads a
+    local reranker instead.
+    """
+
+    @staticmethod
+    def _build_graph(monkeypatch: pytest.MonkeyPatch, rerank_kwargs: dict[str, Any]) -> Any:
+        """Build the default graph with only the rerank stage kept real."""
+
+        class _PassthroughOperator(AbstractOperator):
+            def preprocess(self, data: Any, **kwargs: Any) -> Any:
+                return data
+
+            def process(self, data: Any, **kwargs: Any) -> Any:
+                return data
+
+            def postprocess(self, data: Any, **kwargs: Any) -> Any:
+                return data
+
+        monkeypatch.setattr(
+            "nemo_retriever.operators.embed.operators._BatchEmbedActor",
+            _PassthroughOperator,
+        )
+        monkeypatch.setattr(
+            "nemo_retriever.graph.retriever.RetrieveVdbOperator",
+            _PassthroughOperator,
+        )
+        retriever = _make_retriever(rerank=True, rerank_kwargs=rerank_kwargs)
+        return retriever._build_default_graph()
+
+    @staticmethod
+    def _rerank_node(graph: Any) -> Any:
+        node = graph.roots[0]
+        while node.children:
+            node = node.children[0]
+        return node
+
+    @pytest.mark.parametrize("endpoint_key", ["rerank_invoke_url", "invoke_url"])
+    def test_configured_endpoint_selects_remote_reranker(
+        self, monkeypatch: pytest.MonkeyPatch, endpoint_key: str
+    ) -> None:
+        from nemo_retriever.operators.rerank import NemotronRerankActor, NemotronRerankCPUActor
+
+        graph = self._build_graph(monkeypatch, {endpoint_key: "http://localhost:8015", "refine_factor": 4})
+        node = self._rerank_node(graph)
+
+        assert isinstance(node.operator, NemotronRerankActor)
+        assert NemotronRerankActor.prefers_cpu_variant(node.operator_kwargs) is True
+
+        delegate = node.operator._resolve_delegate()
+        assert isinstance(delegate, NemotronRerankCPUActor)
+        assert delegate._kwargs["rerank_invoke_url"] == "http://localhost:8015"
+
+    def test_absent_endpoint_still_reranks_locally(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from nemo_retriever.operators.rerank import NemotronRerankActor
+
+        graph = self._build_graph(monkeypatch, {"local_reranker_backend": "hf"})
+        node = self._rerank_node(graph)
+
+        assert node.operator_kwargs.get("rerank_invoke_url") is None
+        assert NemotronRerankActor.prefers_cpu_variant(node.operator_kwargs) is False
 
 
 class TestRetrieverDefaults:

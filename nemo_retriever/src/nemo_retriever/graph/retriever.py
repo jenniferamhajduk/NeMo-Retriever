@@ -201,8 +201,16 @@ class Retriever:
         vdb_call_kwargs: Optional[dict[str, Any]],
         embed_extra: Optional[dict[str, Any]],
     ) -> list[list[dict[str, Any]]]:
-        embed_params = self._merge_embed_params(embed_extra)
-        text_col = str(embed_params.text_column)
+        if self.graph is None:
+            embed_params = self._merge_embed_params(embed_extra)
+            text_col = str(embed_params.text_column)
+        else:
+            # A caller-owned graph controls its own operators and does not
+            # require default embedding configuration. In particular, avoid
+            # resolving a local embedding model merely to choose its input
+            # column. Agentic result graphs use ``query_text`` and delegate
+            # actual retrieval to their configured inner retriever.
+            text_col = str({**dict(self.embed_kwargs or {}), **dict(embed_extra or {})}.get("text_column") or "text")
         df = pd.DataFrame({text_col: query_texts})
 
         # Hybrid retrieval relies on these ordered query strings staying aligned
@@ -443,10 +451,22 @@ class Retriever:
         explicit_model = self._embedding_model_from_kwargs(embed_kwargs) or self._embedding_model_from_kwargs(
             self.embed_kwargs
         )
-        if self.graph is None and explicit_model is None:
+        if self.graph is None:
             metadata_reader = RetrieveVdbOperator(**_coerce_vdb_init(self.vdb_kwargs))
             index_model = metadata_reader.get_index_metadata("embedding_model_name", **vdb_call_kwargs)
             index_revision = metadata_reader.get_index_metadata("embedding_model_revision", **vdb_call_kwargs)
+            if explicit_model and index_model:
+                resolved_explicit_model = resolve_embed_model(explicit_model)
+                resolved_index_model = resolve_embed_model(index_model)
+                if resolved_explicit_model != resolved_index_model:
+                    logger.warning(
+                        "The explicitly configured query embedding model %r differs from the model %r "
+                        "recorded on the index. Results may be unreliable because different embedding "
+                        "models can use incompatible vector spaces. Use the index model or rebuild the "
+                        "index with the query model. Continuing with the explicitly configured model.",
+                        resolved_explicit_model,
+                        resolved_index_model,
+                    )
 
         lancedb_mode = self._resolve_lancedb_query_mode(vdb_call_kwargs)
         for key in _QUERY_ROUTING_VDB_KWARGS:
