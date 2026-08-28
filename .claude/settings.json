@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git remote *)",
+      "Bash(git fetch *)",
+      "Bash(git ls-remote *)",
+      "Bash(git checkout *)",
+      "Bash(git switch *)",
+      "Bash(nvidia-smi -L)",
+      "Bash(uv --version)",
+      "Bash(brev --version)",
+      "Bash(brev ls *)",
+      "Bash(brev shell *)"
+    ]
+  }
+}
